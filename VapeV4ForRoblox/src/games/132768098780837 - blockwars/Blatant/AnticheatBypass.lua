@@ -1,6 +1,3 @@
-local ChaseSpeed
-local CatchupDistance
-local CatchupDelay
 local overParams = RaycastParams.new()
 overParams.RespectCanCollide = true
 
@@ -53,14 +50,13 @@ AnticheatBypass = vape.Categories.Blatant:CreateModule({
 					end
 					oldcf = root.CFrame
 
-					local chase = entitylib.character.Humanoid.WalkSpeed * ChaseSpeed.Value
 					local diff = (oldcf.Position - bypassRoot.Position) * Vector3.new(1, 0, 1)
 					local united = diff.Unit
-					united = united == united and diff.Magnitude > 0.1 and united * chase or Vector3.zero
+					united = united == united and diff.Magnitude > 0.1 and united * entitylib.character.Humanoid.WalkSpeed or Vector3.zero
 					bypassRoot.AssemblyLinearVelocity = Vector3.new(united.X, 0, united.Z)
 					bypassRoot.CFrame = CFrame.lookAlong(Vector3.new(bypassRoot.Position.X, root.Position.Y, bypassRoot.Position.Z), root.CFrame.LookVector)
-					if diff.Magnitude > CatchupDistance.Value and (os.clock() - tpTimer) > CatchupDelay.Value then
-						bypassRoot.CFrame += clampVec(diff, chase)
+					if diff.Magnitude > 6 and (os.clock() - tpTimer) > 0.75 then
+						bypassRoot.CFrame += clampVec(diff, entitylib.character.Humanoid.WalkSpeed)
 						tpTimer = os.clock()
 					end
 
@@ -90,34 +86,4 @@ AnticheatBypass = vape.Categories.Blatant:CreateModule({
 		end
 	end,
 	Tooltip = 'Using various methods to bypass the Anticheat.'
-})
-ChaseSpeed = AnticheatBypass:CreateSlider({
-	Name = 'Chase Speed',
-	Min = 1,
-	Max = 10,
-	Default = 1,
-	Decimal = 10,
-	Suffix = 'x walkspeed',
-	Tooltip = 'How fast the fake root is allowed to follow you.\nRaise this to stop setbacks at high speeds, lower it if the anticheat starts striking.'
-})
-CatchupDistance = AnticheatBypass:CreateSlider({
-	Name = 'Catchup Distance',
-	Min = 1,
-	Max = 30,
-	Default = 6,
-	Suffix = function(val)
-		return val == 1 and 'stud' or 'studs'
-	end,
-	Tooltip = 'How far the fake root may drift behind you before it teleports to catch up'
-})
-CatchupDelay = AnticheatBypass:CreateSlider({
-	Name = 'Catchup Delay',
-	Min = 0,
-	Max = 2,
-	Default = 0.75,
-	Decimal = 100,
-	Suffix = function(val)
-		return val == 1 and 'second' or 'seconds'
-	end,
-	Tooltip = 'Minimum time between catchup teleports.\nLower means the fake root keeps up with faster movement.'
 })

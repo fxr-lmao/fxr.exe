@@ -338,25 +338,27 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 		end
 	end,
 	ExtraText = function()
-		return phase
+		-- The text gui concatenates this unconditionally, so returning nil
+		-- errors mid render and the whole module stops being drawn.
+		return phase or 'Idle'
 	end,
 	Tooltip = 'Flies to every enemy bed and breaks it, restocks between beds, then hunts down whoever is left.'
 })
 FlySpeed = AutoFarm:CreateSlider({
 	Name = 'Fly speed',
 	Min = 1,
-	Max = 150,
+	Max = 38,
 	Default = 18,
 	Suffix = function(val)
 		return val == 1 and 'stud' or 'studs'
 	end,
-	Tooltip = 'Sideways travel only, which is the part the bypass has to cover.\nRaise AnticheatBypass Chase Speed before raising this or you get set back.'
+	Tooltip = 'Sideways travel only, which is the part the bypass has to cover.\nIt keeps up with roughly 37 studs, so past that you get set back.'
 })
 ClimbSpeed = AutoFarm:CreateSlider({
 	Name = 'Climb speed',
 	Min = 1,
-	Max = 150,
-	Default = 45,
+	Max = 38,
+	Default = 38,
 	Suffix = function(val)
 		return val == 1 and 'stud' or 'studs'
 	end,
