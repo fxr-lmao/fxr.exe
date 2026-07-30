@@ -1,4 +1,5 @@
 local AutoFarm
+local FarmKills
 local FlySpeed
 local ClimbSpeed
 local BedHeight
@@ -16,6 +17,7 @@ local shopUntil
 local phase
 local closest, progressed
 local cruise, stage
+local routeIgnore
 local overlapCheck = OverlapParams.new()
 local pathCheck = RaycastParams.new()
 pathCheck.RespectCanCollide = true
@@ -49,8 +51,11 @@ local function nearest(list, position, filter)
 	return best
 end
 
+-- Whatever we are flying at has to be ignored, or the ray stops on the target
+-- itself and every trip reads as obstructed. Chasing a player was the bad case:
+-- their own body blocked the line, so the router never flew direct.
 local function blocked(from, to)
-	pathCheck.FilterDescendantsInstances = {lplr.Character, gameCamera}
+	pathCheck.FilterDescendantsInstances = {lplr.Character, gameCamera, routeIgnore}
 	return workspace:Raycast(from, to - from, pathCheck) ~= nil
 end
 
@@ -166,7 +171,10 @@ local function flyTo(goal, dt)
 			moveVertical(root, delta.Y, dt)
 			return
 		end
-		cruise = math.max(position.Y, goal.Y) + Clearance.Value
+		-- Clearance goes above the goal, never above wherever we already are.
+		-- Adding it to our own height ratchets: every re-plan while chasing a
+		-- moving target set a cruise higher than the last, and it just climbed.
+		cruise = math.max(goal.Y + Clearance.Value, position.Y)
 		stage = 'climb'
 	end
 
@@ -220,6 +228,34 @@ local function setEnabled(module, wanted)
 	end
 end
 
+-- Close on whoever is nearest and let Killaura do the rest. Once they die
+-- entitylib stops returning them and the next call picks the next group up.
+local function huntPlayers(position, beds, dt)
+	local enemy = entitylib.EntityPosition({
+		Range = math.huge,
+		Part = 'RootPart',
+		Players = true,
+		NPCs = true
+	})
+	if not enemy then
+		routeIgnore = nil
+		madeProgress()
+		return
+	end
+
+	routeIgnore = enemy.Character
+	local goal = enemy.RootPart.Position
+	local distance = (goal - position).Magnitude
+	if distance > StopDistance.Value then
+		checkStuck(distance, beds)
+		flyTo(goal, dt)
+	else
+		madeProgress()
+		stage, cruise = nil, nil
+		entitylib.character.RootPart.AssemblyLinearVelocity = Vector3.zero
+	end
+end
+
 AutoFarm = vape.Categories.Minigames:CreateModule({
 	Name = 'AutoFarm',
 	Function = function(callback)
@@ -251,6 +287,20 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 				setEnabled(Killaura, true)
 				local position = entitylib.character.RootPart.Position
 
+				-- Kills only. Skip beds and shopping entirely and keep moving
+				-- from one target to the next.
+				if FarmKills.Enabled then
+					phase = 'Kills'
+					setEnabled(Breaker, false)
+					setEnabled(AutoBuy, false)
+					if target or shopUntil then
+						target, shopUntil = nil, nil
+						resetRoute()
+					end
+					huntPlayers(position, beds, dt)
+					return
+				end
+
 				-- Stay on one bed until it is actually down, otherwise drifting
 				-- closer to a second bed pulls us off a half broken one.
 				if target and (isBroken(target) or not isEnemyBed(target)) then
@@ -270,6 +320,7 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 							phase = 'Shop'
 							setEnabled(Breaker, false)
 							setEnabled(AutoBuy, true)
+							routeIgnore = shop
 
 							local distance = (shop.Position - position).Magnitude
 							if distance > StopDistance.Value then
@@ -294,6 +345,7 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 				if target then
 					phase = 'Beds'
 					setEnabled(Breaker, true)
+					routeIgnore = target
 					-- Sit above the bed rather than inside the defence, which
 					-- keeps Breaker's line of sight pointed down at the cover.
 					local goal = target.Position + Vector3.new(0, BedHeight.Value, 0)
@@ -304,28 +356,7 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 
 				phase = 'Players'
 				setEnabled(Breaker, false)
-
-				local enemy = entitylib.EntityPosition({
-					Range = math.huge,
-					Part = 'RootPart',
-					Players = true,
-					NPCs = true
-				})
-				if not enemy then
-					madeProgress()
-					return
-				end
-
-				local goal = enemy.RootPart.Position
-				local distance = (goal - position).Magnitude
-				if distance > StopDistance.Value then
-					checkStuck(distance, beds)
-					flyTo(goal, dt)
-				else
-					madeProgress()
-					stage, cruise = nil, nil
-					entitylib.character.RootPart.AssemblyLinearVelocity = Vector3.zero
-				end
+				huntPlayers(position, beds, dt)
 			end))
 		else
 			unclip()
@@ -343,6 +374,21 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 		return phase or 'Idle'
 	end,
 	Tooltip = 'Flies to every enemy bed and breaks it, restocks between beds, then hunts down whoever is left.'
+})
+FarmKills = AutoFarm:CreateToggle({
+	Name = 'Farm kills',
+	Function = function(callback)
+		if ShopTime then
+			Shop.Object.Visible = not callback
+			ShopTime.Object.Visible = not callback and Shop.Enabled
+			BedHeight.Object.Visible = not callback
+		end
+		if AutoFarm.Enabled then
+			target, shopUntil = nil, nil
+			resetRoute()
+		end
+	end,
+	Tooltip = 'Ignore beds entirely and just chase players for the kill count'
 })
 FlySpeed = AutoFarm:CreateSlider({
 	Name = 'Fly speed',
