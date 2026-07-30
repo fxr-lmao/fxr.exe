@@ -10,6 +10,8 @@ local ShopTime
 local AntiSuffocate
 local AutoReset
 local StuckTime
+local ClimbTimeout
+local BedTries
 local restore = {}
 local clipped = {}
 local target
@@ -18,6 +20,8 @@ local phase
 local closest, progressed
 local cruise, stage
 local routeIgnore
+local climbSince
+local attempts, giveup = {}, {}
 local overlapCheck = OverlapParams.new()
 local pathCheck = RaycastParams.new()
 pathCheck.RespectCanCollide = true
@@ -35,7 +39,7 @@ local function isBroken(bed)
 end
 
 local function liveEnemyBed(bed)
-	return isEnemyBed(bed) and not isBroken(bed)
+	return isEnemyBed(bed) and not isBroken(bed) and not giveup[bed]
 end
 
 local function nearest(list, position, filter)
@@ -94,6 +98,15 @@ end
 
 local function resetRoute()
 	closest, progressed, cruise, stage = nil, os.clock(), nil, nil
+	climbSince = nil
+end
+
+-- Respawning is only an escape while we still have a bed to respawn at.
+local function canRespawn(beds)
+	for _, v in beds do
+		if not isEnemyBed(v) and not isBroken(v) then return true end
+	end
+	return false
 end
 
 -- Dying respawns us at base, which unwedges anything geometry related. But with
@@ -112,11 +125,8 @@ local function checkStuck(distance, beds)
 	if (os.clock() - progressed) < StuckTime.Value then return end
 
 	resetRoute()
-	for _, v in beds do
-		if not isEnemyBed(v) and not isBroken(v) then
-			entitylib.character.Humanoid.Health = 0
-			return
-		end
+	if canRespawn(beds) then
+		entitylib.character.Humanoid.Health = 0
 	end
 end
 
@@ -180,11 +190,13 @@ local function flyTo(goal, dt)
 
 	if stage == 'climb' then
 		if position.Y < cruise - 1 then
+			climbSince = climbSince or os.clock()
 			moveVertical(root, cruise - position.Y, dt)
 			madeProgress()
 			return
 		end
 		stage = 'cruise'
+		climbSince = nil
 	end
 
 	if stage == 'cruise' then
@@ -219,6 +231,22 @@ local function flyTo(goal, dt)
 	moveVertical(root, delta.Y, dt)
 	if delta.Magnitude < 2 then
 		stage, cruise = nil, nil
+	end
+end
+
+-- A climb that never tops out is one the anticheat is dragging us back down
+-- from, not a tall build. Give the bed a couple of goes, then leave it for
+-- another team rather than burning the round on a base we cannot get above.
+local function abandonTarget(beds)
+	attempts[target] = (attempts[target] or 0) + 1
+	if attempts[target] >= BedTries.Value then
+		giveup[target] = true
+	end
+
+	target = nil
+	resetRoute()
+	if AutoReset.Enabled and canRespawn(beds) then
+		entitylib.character.Humanoid.Health = 0
 	end
 end
 
@@ -339,6 +367,13 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 
 				if not target then
 					target = nearest(beds, position, liveEnemyBed)
+					if not target and next(giveup) then
+						-- Every team has been written off, so start the list over
+						-- rather than falling through to hunting players mid round.
+						table.clear(giveup)
+						table.clear(attempts)
+						target = nearest(beds, position, liveEnemyBed)
+					end
 					resetRoute()
 				end
 
@@ -346,6 +381,12 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 					phase = 'Beds'
 					setEnabled(Breaker, true)
 					routeIgnore = target
+
+					if climbSince and (os.clock() - climbSince) > ClimbTimeout.Value then
+						abandonTarget(beds)
+						return
+					end
+
 					-- Sit above the bed rather than inside the defence, which
 					-- keeps Breaker's line of sight pointed down at the cover.
 					local goal = target.Position + Vector3.new(0, BedHeight.Value, 0)
@@ -365,6 +406,8 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 			end
 			table.clear(restore)
 			phase, target, shopUntil = nil, nil, nil
+			table.clear(attempts)
+			table.clear(giveup)
 			resetRoute()
 		end
 	end,
@@ -475,6 +518,26 @@ AutoReset = AutoFarm:CreateToggle({
 		end
 	end,
 	Tooltip = 'Respawn when the route stops making progress.\nSkipped when your own bed is gone, since dying then is elimination.'
+})
+ClimbTimeout = AutoFarm:CreateSlider({
+	Name = 'Climb timeout',
+	Min = 1,
+	Max = 20,
+	Default = 7,
+	Suffix = function(val)
+		return val == 1 and 'second' or 'seconds'
+	end,
+	Tooltip = 'Give up on a bed after climbing this long without topping out.\nA climb that never finishes is the anticheat pulling us back down.'
+})
+BedTries = AutoFarm:CreateSlider({
+	Name = 'Tries per bed',
+	Min = 1,
+	Max = 5,
+	Default = 2,
+	Suffix = function(val)
+		return val == 1 and 'try' or 'tries'
+	end,
+	Tooltip = 'Failed climbs before the bed is left alone and another team is picked'
 })
 StuckTime = AutoFarm:CreateSlider({
 	Name = 'Reset after',
