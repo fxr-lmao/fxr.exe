@@ -1143,6 +1143,7 @@ UpdateRate = Breaker:CreateSlider({
 -- ============================================================
 local AutoFarm
 local FlySpeed
+local ClimbSpeed
 local BedHeight
 local StopDistance
 local Clearance
@@ -1157,13 +1158,13 @@ local target
 local shopUntil
 local phase
 local closest, progressed
-local cruise
+local cruise, stage
 local overlapCheck = OverlapParams.new()
 local pathCheck = RaycastParams.new()
 pathCheck.RespectCanCollide = true
 
--- How far above a goal the router is allowed to climb before it admits the
--- route is hopeless and lets the stuck timer respawn us.
+-- How far above a goal the router may climb before it admits the route is
+-- hopeless and lets the stuck timer respawn us.
 local CEILING = 300
 
 local function isEnemyBed(bed)
@@ -1196,9 +1197,6 @@ local function blocked(from, to)
 	return workspace:Raycast(from, to - from, pathCheck) ~= nil
 end
 
--- Nothing to collide with means nothing to get wedged in, which is most of the
--- stuck problem. Only parts that were solid get recorded, so putting them back
--- is just setting them true again.
 local function noclip()
 	local character = lplr.Character
 	if not character then return end
@@ -1228,15 +1226,12 @@ local function insideBlock(root)
 	return false
 end
 
--- Timer only. Called whenever the router is doing something deliberate, so
--- climbing or re-planning never reads as being stuck.
 local function madeProgress()
 	progressed = os.clock()
 end
 
--- Full reset, for when the destination changes and the old route is meaningless.
 local function resetRoute()
-	closest, progressed, cruise = nil, os.clock(), nil
+	closest, progressed, cruise, stage = nil, os.clock(), nil, nil
 end
 
 -- Dying respawns us at base, which unwedges anything geometry related. But with
@@ -1263,62 +1258,102 @@ local function checkStuck(distance, beds)
 	end
 end
 
--- Straight lines walk into buildings. Climb above whatever is in the way, cross
--- at that height, then drop onto the goal -- and if the lane at cruise height is
--- still solid, go higher and try again.
+-- The bypass masks its drift to Vector3.new(1, 0, 1) and copies our Y straight
+-- onto the decoy, so only sideways travel spends its catch up budget. Vertical
+-- gets its own faster allowance because nothing is clamping it.
+local function moveFlat(root, direction, dt)
+	local distance = direction.Magnitude
+	if distance < 0.01 then return end
+	root.CFrame += direction.Unit * math.min(FlySpeed.Value * dt, distance)
+end
+
+local function moveVertical(root, amount, dt)
+	local limit = ClimbSpeed.Value * dt
+	root.CFrame += Vector3.new(0, math.clamp(amount, -limit, limit), 0)
+end
+
+-- Straight lines walk into buildings, so the route climbs over them: rise to a
+-- cruise height, cross at that height, drop onto the goal. The stages are
+-- explicit because deciding afresh each frame made the descent climb straight
+-- back up again, which is what the bouncing was.
 local function flyTo(goal, dt)
 	local root = entitylib.character.RootPart
-	local step = FlySpeed.Value * dt
 	root.AssemblyLinearVelocity = Vector3.zero
 
-	-- Rise out of anything solid we are sitting in, but keep travelling while
-	-- doing it. Returning here is what turned a ceiling into an endless climb.
-	if insideBlock(root) then
-		root.CFrame += Vector3.new(0, step, 0)
+	-- Never while dropping or parked -- there the rise only fights the descent.
+	if stage ~= 'descend' and stage ~= 'hold' and insideBlock(root) then
+		moveVertical(root, math.huge, dt)
 		madeProgress()
 	end
 
 	local position = root.Position
 	local delta = goal - position
 	if delta.Magnitude < 0.1 then
-		cruise = nil
+		stage, cruise = nil, nil
 		return
 	end
 
-	-- Clear line of sight, and not already committed to a route.
-	if not cruise and not blocked(position, goal) then
-		root.CFrame += delta.Unit * math.min(step, delta.Magnitude)
-		return
+	-- Parked on top of a defence. Sink further as Breaker eats through it.
+	if stage == 'hold' then
+		if insideBlock(root) then
+			moveVertical(root, math.huge, dt)
+			madeProgress()
+			return
+		end
+		stage = 'descend'
 	end
 
-	cruise = cruise or math.max(position.Y, goal.Y) + Clearance.Value
+	if not stage then
+		if not blocked(position, goal) then
+			moveFlat(root, Vector3.new(delta.X, 0, delta.Z), dt)
+			moveVertical(root, delta.Y, dt)
+			return
+		end
+		cruise = math.max(position.Y, goal.Y) + Clearance.Value
+		stage = 'climb'
+	end
 
-	if position.Y < cruise - 1 then
-		root.CFrame += Vector3.new(0, math.min(step, cruise - position.Y), 0)
+	if stage == 'climb' then
+		if position.Y < cruise - 1 then
+			moveVertical(root, cruise - position.Y, dt)
+			madeProgress()
+			return
+		end
+		stage = 'cruise'
+	end
+
+	if stage == 'cruise' then
+		local flat = Vector3.new(goal.X - position.X, 0, goal.Z - position.Z)
+		if flat.Magnitude > 2 then
+			local ahead = position + flat.Unit * math.min(flat.Magnitude, 12)
+			if blocked(position, ahead) then
+				-- Not high enough. Past the ceiling stop raising and stop
+				-- feeding the timer, so auto reset takes it instead of looping.
+				if cruise < goal.Y + CEILING then
+					cruise += Clearance.Value
+					stage = 'climb'
+					madeProgress()
+				end
+				return
+			end
+			moveFlat(root, flat, dt)
+			return
+		end
+		stage = 'descend'
+	end
+
+	-- Dropping onto the goal, and never climbing back out of it.
+	if insideBlock(root) then
+		-- As deep as we get without burying ourselves, which is the top of the
+		-- defence -- exactly where Breaker wants to be looking down from.
+		stage = 'hold'
 		madeProgress()
 		return
 	end
-
-	local flat = Vector3.new(goal.X - position.X, 0, goal.Z - position.Z)
-	if flat.Magnitude > 2 then
-		local ahead = position + flat.Unit * math.min(flat.Magnitude, 12)
-		if blocked(position, ahead) then
-			-- Not high enough yet. Past the ceiling stop bumping it and stop
-			-- feeding the timer, so auto reset takes over instead of looping.
-			if cruise < goal.Y + CEILING then
-				cruise += Clearance.Value
-				madeProgress()
-			end
-			return
-		end
-		root.CFrame += flat.Unit * math.min(step, flat.Magnitude)
-		return
-	end
-
-	-- Over the goal now, drop onto it.
-	root.CFrame += delta.Unit * math.min(step, delta.Magnitude)
+	moveFlat(root, Vector3.new(delta.X, 0, delta.Z), dt)
+	moveVertical(root, delta.Y, dt)
 	if delta.Magnitude < 2 then
-		cruise = nil
+		stage, cruise = nil, nil
 	end
 end
 
@@ -1431,7 +1466,7 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 					flyTo(goal, dt)
 				else
 					madeProgress()
-					cruise = nil
+					stage, cruise = nil, nil
 					entitylib.character.RootPart.AssemblyLinearVelocity = Vector3.zero
 				end
 			end))
@@ -1454,11 +1489,21 @@ FlySpeed = AutoFarm:CreateSlider({
 	Name = 'Fly speed',
 	Min = 1,
 	Max = 150,
-	Default = 30,
+	Default = 18,
 	Suffix = function(val)
 		return val == 1 and 'stud' or 'studs'
 	end,
-	Tooltip = 'Past about 37 the bypass cannot keep up and you get set back.\nRaise AnticheatBypass Chase Speed first if you want to go faster.'
+	Tooltip = 'Sideways travel only, which is the part the bypass has to cover.\nRaise AnticheatBypass Chase Speed before raising this or you get set back.'
+})
+ClimbSpeed = AutoFarm:CreateSlider({
+	Name = 'Climb speed',
+	Min = 1,
+	Max = 150,
+	Default = 45,
+	Suffix = function(val)
+		return val == 1 and 'stud' or 'studs'
+	end,
+	Tooltip = 'Up and down travel. The bypass copies our height across untouched,\nso this does not spend any of its catch up budget.'
 })
 Clearance = AutoFarm:CreateSlider({
 	Name = 'Clearance',
