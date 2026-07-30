@@ -315,7 +315,7 @@ run(function()
 	Platform.Parent = nil
 
 	local touchGui = Instance.new('ScreenGui')
-	touchGui.Name = 'VapeFlyButtons'
+	touchGui.Name = 'fxrFlyButtons'
 	touchGui.ResetOnSpawn = false
 	touchGui.DisplayOrder = 10
 	touchGui.Parent = nil
