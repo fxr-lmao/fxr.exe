@@ -2,14 +2,15 @@ local AutoFarm
 local FlySpeed
 local BedHeight
 local StopDistance
-local Defend
-local DefendHealth
+local Shop
+local ShopTime
 local AntiSuffocate
 local AutoReset
 local StuckTime
 local restore = {}
 local clipped = {}
 local target
+local shopUntil
 local phase
 local closest, progressed
 local overlapCheck = OverlapParams.new()
@@ -22,12 +23,10 @@ local function isBroken(bed)
 	return not bed.Parent or (bed:GetAttribute('HP') or 10) <= 0
 end
 
--- Nearest enemy bed still standing. Mirrors the checks Breaker uses, so we
--- only ever fly at something it will actually hit.
-local function nearestBed(beds, position)
+local function nearest(list, position, filter)
 	local best, bestdist
-	for _, v in beds do
-		if not isEnemyBed(v) or isBroken(v) then continue end
+	for _, v in list do
+		if filter and not filter(v) then continue end
 
 		local dist = (v.Position - position).Magnitude
 		if not bestdist or dist < bestdist then
@@ -37,9 +36,8 @@ local function nearestBed(beds, position)
 	return best
 end
 
-local function healthPercent()
-	local humanoid = entitylib.character.Humanoid
-	return humanoid.MaxHealth > 0 and (humanoid.Health / humanoid.MaxHealth) * 100 or 100
+local function liveEnemyBed(bed)
+	return isEnemyBed(bed) and not isBroken(bed)
 end
 
 -- Nothing to collide with means nothing to get wedged in, which is most of the
@@ -118,8 +116,6 @@ local function flyTo(goal, dt)
 	root.CFrame += delta.Unit * math.min(FlySpeed.Value * dt, delta.Magnitude)
 end
 
--- Breaker bails out while isAttacking is set, and Killaura sets it for anything
--- within attack range, so the two cannot usefully run together.
 local function setEnabled(module, wanted)
 	if module and module.Enabled ~= wanted then
 		module:Toggle()
@@ -131,15 +127,20 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 	Function = function(callback)
 		if callback then
 			table.clear(restore)
-			for _, module in {AnticheatBypass, Breaker, Killaura} do
+			for _, module in {AnticheatBypass, Breaker, Killaura, AutoBuy} do
 				if module then
 					restore[module] = module.Enabled
 				end
 			end
+			-- Killaura stays on for the whole run. Breaker already stands down
+			-- on its own while isAttacking is set, so the two share the bed
+			-- phase instead of taking turns, and defenders get answered.
 			setEnabled(AnticheatBypass, true)
+			setEnabled(Killaura, true)
 
 			local beds = collection('BedWarsX_BedSpawn', AutoFarm)
-			target = nil
+			local shops = collection('BedWarsX_ShopNPC', AutoFarm)
+			target, shopUntil = nil, nil
 			resetProgress()
 
 			AutoFarm:Clean(runService.PreSimulation:Connect(function(dt)
@@ -149,30 +150,52 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 					return
 				end
 				noclip()
+				setEnabled(Killaura, true)
 				local position = entitylib.character.RootPart.Position
 
 				-- Stay on one bed until it is actually down, otherwise drifting
 				-- closer to a second bed pulls us off a half broken one.
 				if target and (isBroken(target) or not isEnemyBed(target)) then
+					if Shop.Enabled and isBroken(target) then
+						shopUntil = os.clock() + ShopTime.Value
+					end
 					target = nil
 					resetProgress()
 				end
-				if not target then
-					local found = nearestBed(beds, position)
-					if found ~= target then
-						resetProgress()
+
+				-- Restock between beds. AutoBuy only fires within 20 studs of a
+				-- shop npc, so this just has to park us next to one.
+				if shopUntil then
+					if os.clock() < shopUntil then
+						local shop = nearest(shops, position)
+						if shop then
+							phase = 'Shop'
+							setEnabled(Breaker, false)
+							setEnabled(AutoBuy, true)
+
+							local distance = (shop.Position - position).Magnitude
+							if distance > StopDistance.Value then
+								checkStuck(distance, beds)
+								flyTo(shop.Position, dt)
+							else
+								resetProgress()
+							end
+							return
+						end
 					end
-					target = found
+					shopUntil = nil
+					setEnabled(AutoBuy, false)
+					resetProgress()
+				end
+
+				if not target then
+					target = nearest(beds, position, liveEnemyBed)
+					resetProgress()
 				end
 
 				if target then
-					-- Swinging back only while actually being hurt, so a healthy
-					-- run never stops breaking to trade with a defender.
-					local hurt = Defend.Enabled and healthPercent() < DefendHealth.Value
-					phase = hurt and 'Defending' or 'Beds'
-					setEnabled(Breaker, not hurt)
-					setEnabled(Killaura, hurt)
-
+					phase = 'Beds'
+					setEnabled(Breaker, true)
 					-- Sit above the bed rather than inside the defence, which
 					-- keeps Breaker's line of sight pointed down at the cover.
 					local goal = target.Position + Vector3.new(0, BedHeight.Value, 0)
@@ -183,7 +206,6 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 
 				phase = 'Players'
 				setEnabled(Breaker, false)
-				setEnabled(Killaura, true)
 
 				local enemy = entitylib.EntityPosition({
 					Range = math.huge,
@@ -212,13 +234,13 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 				setEnabled(module, wasEnabled)
 			end
 			table.clear(restore)
-			phase, target = nil, nil
+			phase, target, shopUntil = nil, nil, nil
 		end
 	end,
 	ExtraText = function()
 		return phase
 	end,
-	Tooltip = 'Flies to every enemy bed and breaks it, then hunts down whoever is left.'
+	Tooltip = 'Flies to every enemy bed and breaks it, restocks between beds, then hunts down whoever is left.'
 })
 FlySpeed = AutoFarm:CreateSlider({
 	Name = 'Fly speed',
@@ -248,25 +270,28 @@ StopDistance = AutoFarm:CreateSlider({
 	Suffix = function(val)
 		return val == 1 and 'stud' or 'studs'
 	end,
-	Tooltip = 'How close to close in on a player, keep it inside Killaura attack range'
+	Tooltip = 'How close to close in on a player or a shop'
 })
-Defend = AutoFarm:CreateToggle({
-	Name = 'Fight back',
+Shop = AutoFarm:CreateToggle({
+	Name = 'Shop between beds',
 	Default = true,
 	Function = function(callback)
-		if DefendHealth then
-			DefendHealth.Object.Visible = callback
+		if ShopTime then
+			ShopTime.Object.Visible = callback
 		end
 	end,
-	Tooltip = 'Stop breaking and swing back once your health drops'
+	Tooltip = 'Fly to a shop npc and let AutoBuy restock after every bed'
 })
-DefendHealth = AutoFarm:CreateSlider({
-	Name = 'Fight back at',
+ShopTime = AutoFarm:CreateSlider({
+	Name = 'Shop for',
 	Min = 1,
-	Max = 100,
-	Default = 50,
+	Max = 15,
+	Default = 5,
 	Darker = true,
-	Suffix = '% health'
+	Suffix = function(val)
+		return val == 1 and 'second' or 'seconds'
+	end,
+	Tooltip = 'AutoBuy purchases one item every 0.2s, so allow a few seconds'
 })
 AntiSuffocate = AutoFarm:CreateToggle({
 	Name = 'Anti Suffocate',
