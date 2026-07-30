@@ -2,16 +2,26 @@ local AutoFarm
 local FlySpeed
 local BedHeight
 local StopDistance
-local borrowed = {}
+local AntiSuffocate
+local restore = {}
+local target
 local phase
+local overlapCheck = OverlapParams.new()
 
--- Nearest enemy bed still standing. Mirrors the ownership and HP checks
--- Breaker uses, so we only ever fly at something it will actually hit.
+local function isEnemyBed(bed)
+	return bed:GetAttribute('BedTeamId') ~= (lplr.Team and lplr.Team.Name or '')
+end
+
+local function isBroken(bed)
+	return not bed.Parent or (bed:GetAttribute('HP') or 10) <= 0
+end
+
+-- Nearest enemy bed still standing. Mirrors the checks Breaker uses, so we
+-- only ever fly at something it will actually hit.
 local function nearestBed(beds, position)
 	local best, bestdist
 	for _, v in beds do
-		if v:GetAttribute('BedTeamId') == (lplr.Team and lplr.Team.Name or '') then continue end
-		if (v:GetAttribute('HP') or 10) <= 0 then continue end
+		if not isEnemyBed(v) or isBroken(v) then continue end
 
 		local dist = (v.Position - position).Magnitude
 		if not bestdist or dist < bestdist then
@@ -21,57 +31,92 @@ local function nearestBed(beds, position)
 	return best
 end
 
+-- Flying by CFrame walks straight through geometry, and stopping inside a
+-- block is what suffocates you. Rise until nothing solid overlaps the root.
+local function stuck(root)
+	if not AntiSuffocate.Enabled then return false end
+	overlapCheck.FilterDescendantsInstances = {lplr.Character, gameCamera}
+	for _, part in workspace:GetPartsInPart(root, overlapCheck) do
+		if part.CanCollide then return true end
+	end
+	return false
+end
+
 local function flyTo(goal, dt)
 	local root = entitylib.character.RootPart
-	local delta = goal - root.Position
 	root.AssemblyLinearVelocity = Vector3.zero
+
+	if stuck(root) then
+		root.CFrame += Vector3.new(0, FlySpeed.Value * dt, 0)
+		return
+	end
+
+	local delta = goal - root.Position
 	if delta.Magnitude < 0.1 then return end
 	root.CFrame += delta.Unit * math.min(FlySpeed.Value * dt, delta.Magnitude)
+end
+
+-- Breaker bails out while isAttacking is set, and Killaura sets it for anything
+-- within attack range -- so running both at once means a defended bed never
+-- breaks. Only one of them is live at a time.
+local function setEnabled(module, wanted)
+	if module and module.Enabled ~= wanted then
+		module:Toggle()
+	end
 end
 
 AutoFarm = vape.Categories.Minigames:CreateModule({
 	Name = 'AutoFarm',
 	Function = function(callback)
 		if callback then
-			-- Breaker and Killaura already do the damage, this only does the
-			-- travelling. Remember which ones we switched on so we can put
-			-- them back the way we found them.
-			table.clear(borrowed)
+			table.clear(restore)
 			for _, module in {AnticheatBypass, Breaker, Killaura} do
-				if module and not module.Enabled then
-					module:Toggle()
-					table.insert(borrowed, module)
+				if module then
+					restore[module] = module.Enabled
 				end
 			end
+			setEnabled(AnticheatBypass, true)
 
 			local beds = collection('BedWarsX_BedSpawn', AutoFarm)
+			target = nil
 
 			AutoFarm:Clean(runService.PreSimulation:Connect(function(dt)
 				if not entitylib.isAlive then
-					phase = nil
+					phase, target = nil, nil
 					return
 				end
 				local position = entitylib.character.RootPart.Position
 
-				local bed = nearestBed(beds, position)
-				if bed then
+				-- Stay on one bed until it is actually down, otherwise drifting
+				-- closer to a second bed pulls us off a half broken one.
+				if target and (isBroken(target) or not isEnemyBed(target)) then
+					target = nil
+				end
+				target = target or nearestBed(beds, position)
+
+				if target then
+					phase = 'Beds'
+					setEnabled(Killaura, false)
+					setEnabled(Breaker, true)
 					-- Sit above the bed rather than inside the defence, which
 					-- keeps Breaker's line of sight pointed down at the cover.
-					phase = 'Beds'
-					flyTo(bed.Position + Vector3.new(0, BedHeight.Value, 0), dt)
+					flyTo(target.Position + Vector3.new(0, BedHeight.Value, 0), dt)
 					return
 				end
 
 				phase = 'Players'
-				local target = entitylib.EntityPosition({
+				setEnabled(Breaker, false)
+				setEnabled(Killaura, true)
+
+				local enemy = entitylib.EntityPosition({
 					Range = math.huge,
 					Part = 'RootPart',
 					Players = true,
 					NPCs = true
 				})
-				if not target then return end
+				if not enemy then return end
 
-				local goal = target.RootPart.Position
+				local goal = enemy.RootPart.Position
 				if (goal - position).Magnitude > StopDistance.Value then
 					flyTo(goal, dt)
 				else
@@ -79,13 +124,11 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 				end
 			end))
 		else
-			for _, module in borrowed do
-				if module.Enabled then
-					module:Toggle()
-				end
+			for module, wasEnabled in restore do
+				setEnabled(module, wasEnabled)
 			end
-			table.clear(borrowed)
-			phase = nil
+			table.clear(restore)
+			phase, target = nil, nil
 		end
 	end,
 	ExtraText = function()
@@ -122,4 +165,9 @@ StopDistance = AutoFarm:CreateSlider({
 		return val == 1 and 'stud' or 'studs'
 	end,
 	Tooltip = 'How close to close in on a player, keep it inside Killaura attack range'
+})
+AntiSuffocate = AutoFarm:CreateToggle({
+	Name = 'Anti Suffocate',
+	Default = true,
+	Tooltip = 'Rise out of any block the flight path ends up inside of'
 })

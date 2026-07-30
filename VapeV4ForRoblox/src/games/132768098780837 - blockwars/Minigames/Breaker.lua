@@ -61,7 +61,7 @@ local function attemptBreak(tab, localPosition, tool)
 					blockInstance = target
 				})
 
-				task.wait(0.15)
+				task.wait(BreakSpeed.Value)
 			else
 				bw.RemoteIndex.Mine_AttemptHit:FireServer(v)
 			end
@@ -110,9 +110,10 @@ BreakSpeed = Breaker:CreateSlider({
 	Name = 'Break speed',
 	Min = 0,
 	Max = 0.3,
-	Default = 0.25,
+	Default = 0.15,
 	Decimal = 100,
-	Suffix = 'seconds'
+	Suffix = 'seconds',
+	Tooltip = 'Delay between hits on a bed. Lower is faster, but the server drops hits that arrive too quickly.'
 })
 UpdateRate = Breaker:CreateSlider({
 	Name = 'Update rate',
