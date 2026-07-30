@@ -2,6 +2,7 @@ local AutoFarm
 local FlySpeed
 local BedHeight
 local StopDistance
+local Clearance
 local Shop
 local ShopTime
 local AntiSuffocate
@@ -13,7 +14,14 @@ local target
 local shopUntil
 local phase
 local closest, progressed
+local cruise
 local overlapCheck = OverlapParams.new()
+local pathCheck = RaycastParams.new()
+pathCheck.RespectCanCollide = true
+
+-- How far above a goal the router is allowed to climb before it admits the
+-- route is hopeless and lets the stuck timer respawn us.
+local CEILING = 300
 
 local function isEnemyBed(bed)
 	return bed:GetAttribute('BedTeamId') ~= (lplr.Team and lplr.Team.Name or '')
@@ -21,6 +29,10 @@ end
 
 local function isBroken(bed)
 	return not bed.Parent or (bed:GetAttribute('HP') or 10) <= 0
+end
+
+local function liveEnemyBed(bed)
+	return isEnemyBed(bed) and not isBroken(bed)
 end
 
 local function nearest(list, position, filter)
@@ -36,8 +48,9 @@ local function nearest(list, position, filter)
 	return best
 end
 
-local function liveEnemyBed(bed)
-	return isEnemyBed(bed) and not isBroken(bed)
+local function blocked(from, to)
+	pathCheck.FilterDescendantsInstances = {lplr.Character, gameCamera}
+	return workspace:Raycast(from, to - from, pathCheck) ~= nil
 end
 
 -- Nothing to collide with means nothing to get wedged in, which is most of the
@@ -63,9 +76,7 @@ local function unclip()
 	table.clear(clipped)
 end
 
--- Noclip stops us snagging on geometry but not from parking inside a block,
--- and that is what suffocates. Rise until nothing solid overlaps the root.
-local function buried(root)
+local function insideBlock(root)
 	if not AntiSuffocate.Enabled then return false end
 	overlapCheck.FilterDescendantsInstances = {lplr.Character, gameCamera}
 	for _, part in workspace:GetPartsInPart(root, overlapCheck) do
@@ -74,8 +85,15 @@ local function buried(root)
 	return false
 end
 
-local function resetProgress()
-	closest, progressed = nil, os.clock()
+-- Timer only. Called whenever the router is doing something deliberate, so
+-- climbing or re-planning never reads as being stuck.
+local function madeProgress()
+	progressed = os.clock()
+end
+
+-- Full reset, for when the destination changes and the old route is meaningless.
+local function resetRoute()
+	closest, progressed, cruise = nil, os.clock(), nil
 end
 
 -- Dying respawns us at base, which unwedges anything geometry related. But with
@@ -84,7 +102,7 @@ local function checkStuck(distance, beds)
 	if not AutoReset.Enabled then return end
 
 	if distance < 2 then
-		resetProgress()
+		madeProgress()
 		return
 	end
 	if not closest or distance < closest - 1 then
@@ -93,7 +111,7 @@ local function checkStuck(distance, beds)
 	end
 	if (os.clock() - progressed) < StuckTime.Value then return end
 
-	resetProgress()
+	resetRoute()
 	for _, v in beds do
 		if not isEnemyBed(v) and not isBroken(v) then
 			entitylib.character.Humanoid.Health = 0
@@ -102,18 +120,63 @@ local function checkStuck(distance, beds)
 	end
 end
 
+-- Straight lines walk into buildings. Climb above whatever is in the way, cross
+-- at that height, then drop onto the goal -- and if the lane at cruise height is
+-- still solid, go higher and try again.
 local function flyTo(goal, dt)
 	local root = entitylib.character.RootPart
+	local step = FlySpeed.Value * dt
 	root.AssemblyLinearVelocity = Vector3.zero
 
-	if buried(root) then
-		root.CFrame += Vector3.new(0, FlySpeed.Value * dt, 0)
+	-- Rise out of anything solid we are sitting in, but keep travelling while
+	-- doing it. Returning here is what turned a ceiling into an endless climb.
+	if insideBlock(root) then
+		root.CFrame += Vector3.new(0, step, 0)
+		madeProgress()
+	end
+
+	local position = root.Position
+	local delta = goal - position
+	if delta.Magnitude < 0.1 then
+		cruise = nil
 		return
 	end
 
-	local delta = goal - root.Position
-	if delta.Magnitude < 0.1 then return end
-	root.CFrame += delta.Unit * math.min(FlySpeed.Value * dt, delta.Magnitude)
+	-- Clear line of sight, and not already committed to a route.
+	if not cruise and not blocked(position, goal) then
+		root.CFrame += delta.Unit * math.min(step, delta.Magnitude)
+		return
+	end
+
+	cruise = cruise or math.max(position.Y, goal.Y) + Clearance.Value
+
+	if position.Y < cruise - 1 then
+		root.CFrame += Vector3.new(0, math.min(step, cruise - position.Y), 0)
+		madeProgress()
+		return
+	end
+
+	local flat = Vector3.new(goal.X - position.X, 0, goal.Z - position.Z)
+	if flat.Magnitude > 2 then
+		local ahead = position + flat.Unit * math.min(flat.Magnitude, 12)
+		if blocked(position, ahead) then
+			-- Not high enough yet. Past the ceiling stop bumping it and stop
+			-- feeding the timer, so auto reset takes over instead of looping.
+			if cruise < goal.Y + CEILING then
+				cruise += Clearance.Value
+				madeProgress()
+			end
+			return
+		end
+		root.CFrame += flat.Unit * math.min(step, flat.Magnitude)
+		return
+	end
+
+	-- Over the goal now, drop onto it.
+	root.CFrame += delta.Unit * math.min(step, delta.Magnitude)
+	if delta.Magnitude < 2 then
+		cruise = nil
+	end
 end
 
 local function setEnabled(module, wanted)
@@ -141,12 +204,12 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 			local beds = collection('BedWarsX_BedSpawn', AutoFarm)
 			local shops = collection('BedWarsX_ShopNPC', AutoFarm)
 			target, shopUntil = nil, nil
-			resetProgress()
+			resetRoute()
 
 			AutoFarm:Clean(runService.PreSimulation:Connect(function(dt)
 				if not entitylib.isAlive then
 					phase, target = nil, nil
-					resetProgress()
+					resetRoute()
 					return
 				end
 				noclip()
@@ -160,7 +223,7 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 						shopUntil = os.clock() + ShopTime.Value
 					end
 					target = nil
-					resetProgress()
+					resetRoute()
 				end
 
 				-- Restock between beds. AutoBuy only fires within 20 studs of a
@@ -178,19 +241,19 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 								checkStuck(distance, beds)
 								flyTo(shop.Position, dt)
 							else
-								resetProgress()
+								madeProgress()
 							end
 							return
 						end
 					end
 					shopUntil = nil
 					setEnabled(AutoBuy, false)
-					resetProgress()
+					resetRoute()
 				end
 
 				if not target then
 					target = nearest(beds, position, liveEnemyBed)
-					resetProgress()
+					resetRoute()
 				end
 
 				if target then
@@ -214,7 +277,7 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 					NPCs = true
 				})
 				if not enemy then
-					resetProgress()
+					madeProgress()
 					return
 				end
 
@@ -224,7 +287,8 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 					checkStuck(distance, beds)
 					flyTo(goal, dt)
 				else
-					resetProgress()
+					madeProgress()
+					cruise = nil
 					entitylib.character.RootPart.AssemblyLinearVelocity = Vector3.zero
 				end
 			end))
@@ -235,6 +299,7 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 			end
 			table.clear(restore)
 			phase, target, shopUntil = nil, nil, nil
+			resetRoute()
 		end
 	end,
 	ExtraText = function()
@@ -251,6 +316,16 @@ FlySpeed = AutoFarm:CreateSlider({
 		return val == 1 and 'stud' or 'studs'
 	end,
 	Tooltip = 'Past about 37 the bypass cannot keep up and you get set back.\nRaise AnticheatBypass Chase Speed first if you want to go faster.'
+})
+Clearance = AutoFarm:CreateSlider({
+	Name = 'Clearance',
+	Min = 2,
+	Max = 40,
+	Default = 12,
+	Suffix = function(val)
+		return val == 1 and 'stud' or 'studs'
+	end,
+	Tooltip = 'How far above an obstacle to cross it.\nRaise this if it keeps clipping the tops of builds.'
 })
 BedHeight = AutoFarm:CreateSlider({
 	Name = 'Bed height',
@@ -296,7 +371,7 @@ ShopTime = AutoFarm:CreateSlider({
 AntiSuffocate = AutoFarm:CreateToggle({
 	Name = 'Anti Suffocate',
 	Default = true,
-	Tooltip = 'Rise out of any block the flight path ends up inside of'
+	Tooltip = 'Rise out of any block we end up inside of, while still travelling'
 })
 AutoReset = AutoFarm:CreateToggle({
 	Name = 'Auto reset',
@@ -306,13 +381,13 @@ AutoReset = AutoFarm:CreateToggle({
 			StuckTime.Object.Visible = callback
 		end
 	end,
-	Tooltip = 'Respawn when the flight stops making progress.\nSkipped when your own bed is gone, since dying then is elimination.'
+	Tooltip = 'Respawn when the route stops making progress.\nSkipped when your own bed is gone, since dying then is elimination.'
 })
 StuckTime = AutoFarm:CreateSlider({
 	Name = 'Reset after',
 	Min = 1,
 	Max = 15,
-	Default = 5,
+	Default = 8,
 	Darker = true,
 	Suffix = function(val)
 		return val == 1 and 'second' or 'seconds'
