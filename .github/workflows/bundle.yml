@@ -1,0 +1,51 @@
+name: Bundle game files
+
+# Rebuilds dist/<PlaceId>.lua whenever a game module changes, so the loadstring
+# in dist/loader.lua always serves the current source. Note this lives at the
+# repo root on purpose -- GitHub only runs workflows from the root .github
+# directory, so VapeV4ForRoblox/.github/workflows/build.yaml never fires.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'VapeV4ForRoblox/src/games/**'
+      - 'VapeV4ForRoblox/tools/bundlegame.js'
+      - '.github/workflows/bundle.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # One entry per game the loader serves. Adding a game means adding it
+      # here and to the BUNDLES table in dist/loader.lua. Folders past Luau's
+      # local cap (bedwars, prison life) cannot be flattened and will fail
+      # here by design -- they need the upstream bundler.
+      - name: Bundle game folders
+        run: |
+          mkdir -p dist
+          node VapeV4ForRoblox/tools/bundlegame.js \
+            "VapeV4ForRoblox/src/games/132768098780837 - blockwars" \
+            -o dist/132768098780837.lua
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain dist)" ]; then
+            git add dist
+            git commit -m "Rebuild bundled game files"
+            git push
+          else
+            echo "dist already up to date"
+          fi
