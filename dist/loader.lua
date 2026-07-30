@@ -23,9 +23,9 @@ local BUNDLES = {
 	[132768098780837] = REPO..'132768098780837.lua'
 }
 
--- Drop a png here in the repo and it becomes the logo. Until then the header
--- falls back to an fxr wordmark, which suits that slot better anyway: it is
--- 62x18 and the gui tints it to a flat colour, so artwork loses its detail.
+-- The mascot, shown on the gui button. Whatever png sits at this path in the
+-- repo gets installed and used, so changing the logo is changing that file.
+-- The window header is a separate slot and gets a wordmark instead, see below.
 local LOGO_URL = REPO..'assets/fxrlogo.png'
 local LOGO_FILE = 'newvape/assets/new/fxrlogo.png'
 
@@ -54,14 +54,7 @@ local function installLogo()
 	return true
 end
 
-local function brandLogo(logo, custom)
-	if custom then
-		logo.Image = getcustomasset(LOGO_FILE)
-		local existing = logo:FindFirstChild('BrandText')
-		if existing then existing:Destroy() end
-		return
-	end
-
+local function brandLogo(logo)
 	logo.Image = ''
 	local label = logo:FindFirstChild('BrandText')
 	if not label then
@@ -78,14 +71,40 @@ local function brandLogo(logo, custom)
 	label.TextColor3 = logo.ImageColor3
 end
 
+-- Match on the asset each image is showing rather than on its name. The gui
+-- button's ImageLabel is never named, so going by name missed it entirely and
+-- left the vape pen sitting on screen.
+local HEADER = 'newvape/assets/new/guivape.png'
+local BADGE = 'newvape/assets/new/guiv4.png'
+local ICON = 'newvape/assets/new/vape.png'
+
+local function assetMap()
+	local map = {}
+	for _, path in {HEADER, BADGE, ICON} do
+		local ok, asset = pcall(getcustomasset, path)
+		if ok and asset then
+			map[asset] = path
+		end
+	end
+	return map
+end
+
 local function rebrand(vape, custom)
 	if not vape or not vape.gui then return end
+	local map = assetMap()
 
 	for _, obj in vape.gui:GetDescendants() do
-		if obj:IsA('ImageLabel') and obj.Name == 'VapeLogo' then
-			brandLogo(obj, custom)
-		elseif obj:IsA('ImageLabel') and obj.Name == 'V4Logo' then
-			obj.Visible = false
+		if obj:IsA('ImageLabel') or obj:IsA('ImageButton') then
+			local path = map[obj.Image]
+			if path == BADGE then
+				obj.Visible = false
+			elseif path == HEADER then
+				-- 62x18 and recoloured to a flat tint, so a wordmark, never art.
+				brandLogo(obj)
+			elseif path == ICON and custom then
+				-- 26x26 and untouched by ImageColor3, so the mascot works here.
+				obj.Image = getcustomasset(LOGO_FILE)
+			end
 		elseif obj:IsA('TextLabel') and obj.Text:sub(1, 5) == 'Vape ' then
 			obj.Text = BRAND..obj.Text:sub(5)
 		end
