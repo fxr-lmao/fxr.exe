@@ -1076,7 +1076,7 @@ local function attemptBreak(tab, localPosition, tool)
 					blockInstance = target
 				})
 
-				task.wait(0.15)
+				task.wait(BreakSpeed.Value)
 			else
 				bw.RemoteIndex.Mine_AttemptHit:FireServer(v)
 			end
@@ -1125,9 +1125,10 @@ BreakSpeed = Breaker:CreateSlider({
 	Name = 'Break speed',
 	Min = 0,
 	Max = 0.3,
-	Default = 0.25,
+	Default = 0.15,
 	Decimal = 100,
-	Suffix = 'seconds'
+	Suffix = 'seconds',
+	Tooltip = 'Delay between hits on a bed. Lower is faster, but the server drops hits that arrive too quickly.'
 })
 UpdateRate = Breaker:CreateSlider({
 	Name = 'Update rate',
@@ -1144,16 +1145,26 @@ local AutoFarm
 local FlySpeed
 local BedHeight
 local StopDistance
-local borrowed = {}
+local AntiSuffocate
+local restore = {}
+local target
 local phase
+local overlapCheck = OverlapParams.new()
 
--- Nearest enemy bed still standing. Mirrors the ownership and HP checks
--- Breaker uses, so we only ever fly at something it will actually hit.
+local function isEnemyBed(bed)
+	return bed:GetAttribute('BedTeamId') ~= (lplr.Team and lplr.Team.Name or '')
+end
+
+local function isBroken(bed)
+	return not bed.Parent or (bed:GetAttribute('HP') or 10) <= 0
+end
+
+-- Nearest enemy bed still standing. Mirrors the checks Breaker uses, so we
+-- only ever fly at something it will actually hit.
 local function nearestBed(beds, position)
 	local best, bestdist
 	for _, v in beds do
-		if v:GetAttribute('BedTeamId') == (lplr.Team and lplr.Team.Name or '') then continue end
-		if (v:GetAttribute('HP') or 10) <= 0 then continue end
+		if not isEnemyBed(v) or isBroken(v) then continue end
 
 		local dist = (v.Position - position).Magnitude
 		if not bestdist or dist < bestdist then
@@ -1163,57 +1174,92 @@ local function nearestBed(beds, position)
 	return best
 end
 
+-- Flying by CFrame walks straight through geometry, and stopping inside a
+-- block is what suffocates you. Rise until nothing solid overlaps the root.
+local function stuck(root)
+	if not AntiSuffocate.Enabled then return false end
+	overlapCheck.FilterDescendantsInstances = {lplr.Character, gameCamera}
+	for _, part in workspace:GetPartsInPart(root, overlapCheck) do
+		if part.CanCollide then return true end
+	end
+	return false
+end
+
 local function flyTo(goal, dt)
 	local root = entitylib.character.RootPart
-	local delta = goal - root.Position
 	root.AssemblyLinearVelocity = Vector3.zero
+
+	if stuck(root) then
+		root.CFrame += Vector3.new(0, FlySpeed.Value * dt, 0)
+		return
+	end
+
+	local delta = goal - root.Position
 	if delta.Magnitude < 0.1 then return end
 	root.CFrame += delta.Unit * math.min(FlySpeed.Value * dt, delta.Magnitude)
+end
+
+-- Breaker bails out while isAttacking is set, and Killaura sets it for anything
+-- within attack range -- so running both at once means a defended bed never
+-- breaks. Only one of them is live at a time.
+local function setEnabled(module, wanted)
+	if module and module.Enabled ~= wanted then
+		module:Toggle()
+	end
 end
 
 AutoFarm = vape.Categories.Minigames:CreateModule({
 	Name = 'AutoFarm',
 	Function = function(callback)
 		if callback then
-			-- Breaker and Killaura already do the damage, this only does the
-			-- travelling. Remember which ones we switched on so we can put
-			-- them back the way we found them.
-			table.clear(borrowed)
+			table.clear(restore)
 			for _, module in {AnticheatBypass, Breaker, Killaura} do
-				if module and not module.Enabled then
-					module:Toggle()
-					table.insert(borrowed, module)
+				if module then
+					restore[module] = module.Enabled
 				end
 			end
+			setEnabled(AnticheatBypass, true)
 
 			local beds = collection('BedWarsX_BedSpawn', AutoFarm)
+			target = nil
 
 			AutoFarm:Clean(runService.PreSimulation:Connect(function(dt)
 				if not entitylib.isAlive then
-					phase = nil
+					phase, target = nil, nil
 					return
 				end
 				local position = entitylib.character.RootPart.Position
 
-				local bed = nearestBed(beds, position)
-				if bed then
+				-- Stay on one bed until it is actually down, otherwise drifting
+				-- closer to a second bed pulls us off a half broken one.
+				if target and (isBroken(target) or not isEnemyBed(target)) then
+					target = nil
+				end
+				target = target or nearestBed(beds, position)
+
+				if target then
+					phase = 'Beds'
+					setEnabled(Killaura, false)
+					setEnabled(Breaker, true)
 					-- Sit above the bed rather than inside the defence, which
 					-- keeps Breaker's line of sight pointed down at the cover.
-					phase = 'Beds'
-					flyTo(bed.Position + Vector3.new(0, BedHeight.Value, 0), dt)
+					flyTo(target.Position + Vector3.new(0, BedHeight.Value, 0), dt)
 					return
 				end
 
 				phase = 'Players'
-				local target = entitylib.EntityPosition({
+				setEnabled(Breaker, false)
+				setEnabled(Killaura, true)
+
+				local enemy = entitylib.EntityPosition({
 					Range = math.huge,
 					Part = 'RootPart',
 					Players = true,
 					NPCs = true
 				})
-				if not target then return end
+				if not enemy then return end
 
-				local goal = target.RootPart.Position
+				local goal = enemy.RootPart.Position
 				if (goal - position).Magnitude > StopDistance.Value then
 					flyTo(goal, dt)
 				else
@@ -1221,13 +1267,11 @@ AutoFarm = vape.Categories.Minigames:CreateModule({
 				end
 			end))
 		else
-			for _, module in borrowed do
-				if module.Enabled then
-					module:Toggle()
-				end
+			for module, wasEnabled in restore do
+				setEnabled(module, wasEnabled)
 			end
-			table.clear(borrowed)
-			phase = nil
+			table.clear(restore)
+			phase, target = nil, nil
 		end
 	end,
 	ExtraText = function()
@@ -1264,6 +1308,117 @@ StopDistance = AutoFarm:CreateSlider({
 		return val == 1 and 'stud' or 'studs'
 	end,
 	Tooltip = 'How close to close in on a player, keep it inside Killaura attack range'
+})
+AntiSuffocate = AutoFarm:CreateToggle({
+	Name = 'Anti Suffocate',
+	Default = true,
+	Tooltip = 'Rise out of any block the flight path ends up inside of'
+})
+
+-- ============================================================
+-- Render/BedESP.lua
+-- ============================================================
+local BedESP
+local ShowOwn
+local ShowBroken
+local adornments = {}
+
+local ENEMY = Color3.fromRGB(255, 65, 65)
+local OWN = Color3.fromRGB(80, 200, 255)
+local BROKEN = Color3.fromRGB(130, 130, 130)
+
+local function isOwnBed(bed)
+	return bed:GetAttribute('BedTeamId') == (lplr.Team and lplr.Team.Name or '')
+end
+
+local function adorn(bed)
+	local highlight = Instance.new('Highlight')
+	highlight.Adornee = bed
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.FillTransparency = 0.6
+	highlight.Parent = vape.gui
+
+	local billboard = Instance.new('BillboardGui')
+	billboard.Adornee = bed
+	billboard.Size = UDim2.fromOffset(200, 24)
+	billboard.StudsOffset = Vector3.new(0, 3, 0)
+	billboard.AlwaysOnTop = true
+	billboard.Parent = vape.gui
+
+	local label = Instance.new('TextLabel')
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.TextStrokeTransparency = 0.4
+	label.TextSize = 15
+	label.Font = Enum.Font.GothamBold
+	label.Parent = billboard
+
+	adornments[bed] = {Highlight = highlight, Billboard = billboard, Label = label}
+	return adornments[bed]
+end
+
+local function refresh(bed)
+	local entry = adornments[bed] or adorn(bed)
+	local own = isOwnBed(bed)
+	local hp = bed:GetAttribute('HP') or 10
+	local broken = hp <= 0
+
+	-- The whole point is not spending five minutes mining your own bed, so the
+	-- label says whose it is rather than relying on colour alone.
+	local visible = (not broken or ShowBroken.Enabled) and (not own or ShowOwn.Enabled)
+	local color = broken and BROKEN or (own and OWN or ENEMY)
+
+	entry.Highlight.Enabled = visible
+	entry.Highlight.FillColor = color
+	entry.Highlight.OutlineColor = color
+	entry.Billboard.Enabled = visible
+	entry.Label.TextColor3 = color
+	entry.Label.Text = broken
+		and ((own and 'YOUR BED' or 'ENEMY BED')..' (broken)')
+		or ((own and 'YOUR BED' or 'ENEMY BED')..' - '..math.floor(hp))
+end
+
+BedESP = vape.Categories.Render:CreateModule({
+	Name = 'BedESP',
+	Function = function(callback)
+		if callback then
+			local beds = collection('BedWarsX_BedSpawn', BedESP)
+
+			BedESP:Clean(runService.Heartbeat:Connect(function()
+				local seen = {}
+				for _, bed in beds do
+					seen[bed] = true
+					refresh(bed)
+				end
+
+				for bed, entry in adornments do
+					if not seen[bed] then
+						entry.Highlight:Destroy()
+						entry.Billboard:Destroy()
+						adornments[bed] = nil
+					end
+				end
+			end))
+
+			BedESP:Clean(function()
+				for bed, entry in adornments do
+					entry.Highlight:Destroy()
+					entry.Billboard:Destroy()
+					adornments[bed] = nil
+				end
+			end)
+		end
+	end,
+	Tooltip = 'Highlights every bed and labels whose team it belongs to.'
+})
+ShowOwn = BedESP:CreateToggle({
+	Name = 'Show own bed',
+	Default = true,
+	Tooltip = 'Also highlight your own bed, in a different colour'
+})
+ShowBroken = BedESP:CreateToggle({
+	Name = 'Show broken beds',
+	Tooltip = 'Keep showing beds that are already destroyed'
 })
 
 -- ============================================================
