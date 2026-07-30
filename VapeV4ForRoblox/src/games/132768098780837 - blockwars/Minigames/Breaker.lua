@@ -23,6 +23,28 @@ local function getPick()
 	end
 end
 
+local rayCheck = RaycastParams.new()
+
+-- The server only accepts a hit it can trace from camPos, so a bed buried under a
+-- defence has to be dug out one layer at a time. Walk the line of sight and return
+-- the outermost placed block standing in the way, or nil for a clear shot at the bed.
+local function getCoveringBlock(bed, localPosition)
+	local ignore = {lplr.Character, gameCamera}
+	local dest = bed:GetClosestPointOnSurface(localPosition)
+
+	for _ = 1, 10 do
+		rayCheck.FilterDescendantsInstances = ignore
+		local ray = workspace:Raycast(localPosition, dest - localPosition, rayCheck)
+		if not ray or ray.Instance == bed then return end
+		if ray.Instance:HasTag('BedWarsX_PlacedBlock') then
+			return ray.Instance
+		end
+
+		-- Decorations and players are not worth breaking, look past them
+		table.insert(ignore, ray.Instance)
+	end
+end
+
 local function attemptBreak(tab, localPosition, tool)
 	if not tab then return end
 	for _, v in tab do
@@ -32,33 +54,12 @@ local function attemptBreak(tab, localPosition, tool)
 			end
 
 			if v:HasTag('BedWarsX_BedSpawn') then
-				local notCovered = false
-				for _, normal in Enum.NormalId:GetEnumItems() do
-					if normal ~= Enum.NormalId.Bottom then
-						if not blocks[v.Position // 3 + Vector3.fromNormalId(normal)] then
-							notCovered = true
-							break
-						end
-					end
-				end
-
-				if notCovered then
-					bw.RemoteIndex.Block_AttemptHit:FireServer({
-						camPos = localPosition,
-						hitPos = v:GetClosestPointOnSurface(localPosition),
-						blockInstance = v
-					})
-				else
-					local aboveBlock = blocks[v.Position // 3 + Vector3.new(0, 1, 0)]
-
-					if aboveBlock then
-						bw.RemoteIndex.Block_AttemptHit:FireServer({
-							camPos = localPosition,
-							hitPos = aboveBlock:GetClosestPointOnSurface(localPosition),
-							blockInstance = aboveBlock
-						})
-					end
-				end
+				local target = getCoveringBlock(v, localPosition) or v
+				bw.RemoteIndex.Block_AttemptHit:FireServer({
+					camPos = localPosition,
+					hitPos = target:GetClosestPointOnSurface(localPosition),
+					blockInstance = target
+				})
 
 				task.wait(0.15)
 			else
